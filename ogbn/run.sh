@@ -4,7 +4,7 @@ N_GPU=${1:-8}
 
 # N_GPU == 1
 if [ $N_GPU -eq 1 ]; then
-    python main_dist.py \
+    python main.py \
     --stages 200 \
     --num-hops 2 \
     --label-feats \
