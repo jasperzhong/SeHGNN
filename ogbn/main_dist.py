@@ -7,6 +7,7 @@ import datetime
 import numpy as np
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from model import *
@@ -16,7 +17,14 @@ from utils import *
 def main(args):
     if args.seed > 0:
         set_random_seed(args.seed)
+        
     g, init_labels, num_nodes, n_classes, train_nid, val_nid, test_nid, evaluator = load_dataset(args)
+
+    dist.init_process_group(backend='nccl', init_method='env://')
+    rank = dist.get_rank()
+    local_rank = rank % torch.cuda.device_count()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
 
     # =======
     # rearange node idx (for feats & labels)
@@ -120,7 +128,7 @@ def main(args):
     else:
         scalar = None
 
-    device = "cuda:{}".format(args.gpu) if not args.cpu else 'cpu'
+    device = "cuda:{}".format(local_rank) if not args.cpu else 'cpu'
     labels_cuda = labels.long().to(device)
 
     checkpt_file = checkpt_folder + uuid.uuid4().hex
@@ -173,7 +181,7 @@ def main(args):
             gen = torch.Generator()
             gen.manual_seed(args.seed)
             train_loader = torch.utils.data.DataLoader(
-                torch.arange(train_node_nums), batch_size=args.batch_size, shuffle=True, drop_last=False,
+                torch.arange(train_node_nums), batch_size=args.batch_size, shuffle=True, drop_last=False, 
                 generator=gen)
 
         # =======
@@ -299,6 +307,22 @@ def main(args):
         if stage > 0:
             del eval_loader
 
+        # assign metapaths to each GPU
+        if len(feats) < world_size:
+            raise RuntimeError(f"Number of metapaths {len(feats)} is less than world size {world_size}.")
+        # local_feats = {k: v for i, (k, v) in enumerate(feats.items()) if i % world_size == rank}
+        if rank == 0:
+            keys = ['P', 'PP', 'PAP', 'PFP', 'PPP']
+        elif rank == 1:
+            keys = ['PA', 'PF', 'PAI', 'PPA', 'PPF']
+
+        local_feats = {k: feats[k] for k in keys if k in feats}
+        global_num_feats = len(feats)
+        feats = local_feats
+        print(f"Rank {rank} has {len(feats)} metapaths")
+
+        label_emb = label_emb.to(device)
+
         eval_loader = []
         for batch_idx in range((num_nodes-trainval_point-1) // args.batch_size + 1):
             batch_start = batch_idx * args.batch_size + trainval_point
@@ -310,7 +334,7 @@ def main(args):
             eval_loader.append((batch_feats, batch_label_feats, batch_labels_emb))
 
         data_size = {k: v.size(-1) for k, v in feats.items()}
-
+        print(f"Rank {rank} data size: {data_size}")
 
         # =======
         # Construct network
@@ -318,7 +342,7 @@ def main(args):
         model = SeHGNN_mag(args.dataset,
             data_size, args.embed_size,
             args.hidden, n_classes,
-            len(feats), len(feats), len(label_feats), tgt_type,
+            len(feats), global_num_feats, len(label_feats), tgt_type,
             dropout=args.dropout,
             input_drop=args.input_drop,
             att_drop=args.att_drop,
@@ -330,17 +354,38 @@ def main(args):
             residual=args.residual,
             bns=args.bns, label_bns=args.label_bns,
             # label_residual=stage > 0,
+            use_dist=True
             )
         model = model.to(device)
+        
+        named_params = {name: p for name, p in model.named_parameters() if p.requires_grad and \
+            (not name.startswith('embedings') and not name.startswith('feat_project_layers'))}
+        named_params = sorted(named_params.items(), key=lambda x: x[0])
+        print(f"Rank {rank} model has {len(named_params)} trainable parameters")
+        if rank == 0:
+            print(named_params)
 
+        for name, p in named_params:
+            torch.distributed.broadcast(p.data, src=0)
+        
+        torch.distributed.barrier()
+        print(f"Rank {rank} model finished broadcasting")
+        
 
         if stage == args.start_stage:
             print(model)
             print("# Params:", get_n_params(model))
 
         loss_fcn = nn.CrossEntropyLoss()
+        print(f"Rank {rank} loss function created")
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                     weight_decay=args.weight_decay)
+        print(f"Rank {rank} optimizer created")
+
+        broadcast_optimizer_state(optimizer, 0, named_params) 
+
+        print(f"Rank {rank} optimizer state broadcasted")
+
 
         best_epoch = 0
         best_val_acc = 0
@@ -356,8 +401,8 @@ def main(args):
             else:
                 loss, acc = train_multi_stage(model, train_loader, enhance_loader, loss_fcn, optimizer, evaluator, device, feats, label_feats, labels_cuda, label_emb, predict_prob, args.gama, scalar=scalar)
             end = time.time()
+            training_time = end - start
 
-            log = "Epoch {}, Time(s): {:.4f}, estimated train loss {:.4f}, acc {:.4f}\n".format(epoch, end-start, loss, acc*100)
             torch.cuda.empty_cache()
 
             if epoch % args.eval_every == 0:
@@ -381,28 +426,38 @@ def main(args):
                     test_acc = evaluator(preds[valid_node_nums:valid_node_nums+test_node_nums], labels[valtest_point:total_num_nodes])
 
                     end = time.time()
-                    log += f'Time: {end-start}, Val loss: {loss_val}, Test loss: {loss_test}\n'
-                    log += 'Val acc: {:.4f}, Test acc: {:.4f}\n'.format(val_acc*100, test_acc*100)
+                    val_time = end - start
+                    # log += f'Time: {end-start}, Val loss: {loss_val}, Test loss: {loss_test}\n'
+                    # log += 'Val acc: {:.4f}, Test acc: {:.4f}\n'.format(val_acc*100, test_acc*100)
+                    # print(f"Rank {rank} eval time: {time.time()-end:.4f}")
 
                 if val_acc > best_val_acc:
                     best_epoch = epoch
                     best_val_acc = val_acc
                     best_test_acc = test_acc
 
-                    torch.save(model.state_dict(), f'{checkpt_file}_{stage}.pkl')
+                    # torch.save(model.state_dict(), f'{checkpt_file}_{stage}_{rank}.pkl')
                     count = 0
                 else:
                     count = count + args.eval_every
                     if count >= args.patience:
                         break
+                
+                results = torch.tensor([training_time, val_time, loss, loss_val, loss_test, acc, val_acc, test_acc], device=device)
+                dist.all_reduce(results, op=dist.ReduceOp.SUM)
+                results /= world_size
+                training_time, val_time, loss, loss_val, loss_test, acc, val_acc, test_acc = results.tolist()
+
+                log = "Epoch {}, Time(s): {:.4f}, estimated train loss {:.4f}, acc {:.4f}\n".format(epoch, training_time, loss, acc*100)
+                log += f'Time: {val_time}, Val loss: {loss_val}, Test loss: {loss_test}\n'
+                log += 'Val acc: {:.4f}, Test acc: {:.4f}\n'.format(val_acc*100, test_acc*100)
                 log += "Best Epoch {},Val {:.4f}, Test {:.4f}".format(best_epoch, best_val_acc*100, best_test_acc*100)
-            print(log, flush=True)
+            if rank == 0:
+                print(log, flush=True)
 
-        print("Best Epoch {}, Val {:.4f}, Test {:.4f}".format(best_epoch, best_val_acc*100, best_test_acc*100))
-
-        model.load_state_dict(torch.load(checkpt_file+f'_{stage}.pkl'))
-        raw_preds = gen_output_torch(model, feats, label_feats, label_emb, all_loader, device)
-        torch.save(raw_preds, checkpt_file+f'_{stage}.pt')
+        # model.load_state_dict(torch.load(checkpt_file+f'_{stage}_{rank}.pkl'))
+        # raw_preds = gen_output_torch(model, feats, label_feats, label_emb, all_loader, device)
+        # torch.save(raw_preds, checkpt_file+f'_{stage}.pt')
 
 
 def parse_args(args=None):

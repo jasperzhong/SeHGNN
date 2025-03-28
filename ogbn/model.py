@@ -2,6 +2,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -125,16 +126,27 @@ class L2Norm(nn.Module):
 
 class SeHGNN_mag(nn.Module):
     def __init__(self, dataset, data_size, nfeat, hidden, nclass,
-                 num_feats, num_label_feats, tgt_key,
+                 num_feats, global_num_feats, num_label_feats, tgt_key,
                  dropout, input_drop, att_drop, label_drop,
                  n_layers_1, n_layers_2, n_layers_3,
                  act, residual=False, bns=False, label_bns=False,
-                 label_residual=True):
+                 label_residual=True, use_dist=False):
         super(SeHGNN_mag, self).__init__()
         self.dataset = dataset
         self.residual = residual
         self.tgt_key = tgt_key
         self.label_residual = label_residual
+        self.use_dist = use_dist
+
+        if self.use_dist:
+            self.rank = dist.get_rank()
+            self.local_rank = self.rank % torch.cuda.device_count()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.local_rank = 0
+            self.world_size = 1
+
 
         if any([v != nfeat for k, v in data_size.items()]):
             self.embedings = nn.ParameterDict({})
@@ -171,7 +183,7 @@ class SeHGNN_mag(nn.Module):
 
         self.semantic_aggr_layers = Transformer(hidden, att_drop, act)
         if self.dataset != 'products':
-            self.concat_project_layer = nn.Linear((num_feats + num_label_feats) * hidden, hidden)
+            self.concat_project_layer = nn.Linear((global_num_feats + num_label_feats) * hidden, hidden)
 
         if self.residual:
             self.res_fc = nn.Linear(nfeat, hidden, bias=False)
@@ -249,7 +261,21 @@ class SeHGNN_mag(nn.Module):
                 if k in self.embedings:
                     feats_dict[k] = v @ self.embedings[k]
 
-        tgt_feat = self.input_drop(feats_dict[self.tgt_key])
+        if self.tgt_key in feats_dict:
+            tgt_feat = self.input_drop(feats_dict[self.tgt_key])
+            # bcast:
+            if self.use_dist:
+                dist.broadcast_object_list([tgt_feat.shape, tgt_feat.dtype], src=0)
+                dist.broadcast(tgt_feat, src=0)
+        else:
+            if self.use_dist:
+                recv = [None, None]
+                dist.broadcast_object_list(recv, src=0)
+                shape, dtype = recv
+
+                tgt_feat = torch.empty(tuple(shape), device=self.local_rank, dtype=dtype)
+                dist.broadcast(tgt_feat, src=0)
+
         B = num_node = tgt_feat.size(0)
         x = self.input_drop(torch.stack(list(feats_dict.values()), dim=1))
         x = self.feat_project_layers(x)
@@ -259,16 +285,33 @@ class SeHGNN_mag(nn.Module):
             label_feats = self.label_feat_project_layers(label_feats)
             x = torch.cat((x, label_feats), dim=1)
 
+        if self.use_dist:
+            local_shape = torch.tensor(x.shape, device=x.device)
+            all_shapes = [torch.empty_like(local_shape) for _ in range(self.world_size)]
+            dist.all_gather(all_shapes, local_shape)
+
+            output_tensors = [torch.empty(tuple(shape.tolist()), device=x.device, dtype=x.dtype) for shape in all_shapes]
+            dist.all_gather(output_tensors, x)
+
+            x = torch.cat(output_tensors, dim=1)
+        
         x = self.semantic_aggr_layers(x)
+
+        #print(f"[1] rank {self.rank} gather x's sum {torch.sum(x)}")    
         if self.dataset == 'products':
             x = x[:,:,0].contiguous()
         else:
             x = self.concat_project_layer(x.reshape(B, -1))
 
+        #print(f"[2] rank {self.rank} gather x's sum {torch.sum(x)}")    
         if self.residual:
             x = x + self.res_fc(tgt_feat)
+        #print(f"[3] rank {self.rank} gather x's sum {torch.sum(x)}")    
         x = self.dropout(self.prelu(x))
         x = self.lr_output(x)
+        #print(f"[4] rank {self.rank} gather x's sum {torch.sum(x)}")    
+        #print(f"[4.5] rank {self.rank} label_emb's sum {torch.sum(label_emb)}")    
         if self.label_residual:
             x = x + self.label_fc(self.label_drop(label_emb))
+        #print(f"[5] rank {self.rank} gather x's sum {torch.sum(x)}")    
         return x

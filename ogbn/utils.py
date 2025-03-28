@@ -1,4 +1,7 @@
 import os
+import cloudpickle
+import io
+import collections
 import sys
 import gc
 import random
@@ -9,6 +12,8 @@ import dgl.function as fn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed
+from torch.distributed import get_rank, get_world_size
 from torch_sparse import SparseTensor
 from torch_sparse import remove_diag, set_diag
 
@@ -136,7 +141,7 @@ def train(model, train_loader, loss_fcn, optimizer, evaluator, device,
     y_true, y_pred = [], []
 
     for batch in train_loader:
-        batch_feats = {k: x[batch].to(device) for k, x in feats.items()}
+        batch_feats = {k: x[batch].to(device, non_blocking=True) for k, x in feats.items()}
         batch_labels_feats = {k: x[batch].to(device) for k, x in label_feats.items()}
         # if mask is not None:
         #     batch_mask = {k: x[batch].to(device) for k, x in mask.items()}
@@ -437,3 +442,190 @@ def load_mag(args, symmetric=True):
         torch.save(PAP_diag, diag_name)
 
     return new_g, init_labels, new_g.num_nodes('P'), n_classes, train_nid, val_nid, test_nid, evaluator
+
+def broadcast_parameters(params, root_rank, comm_group=None):
+    """
+      Broadcasts the parameters from root rank to all other processes.
+      Typical usage is to broadcast the `model.state_dict()`,
+      `model.named_parameters()`, or `model.parameters()`.
+      Arguments:
+          params: One of the following:
+              - list of parameters to broadcast
+              - dict of parameters to broadcast
+          root_rank: The rank of the process from which parameters will be
+                     broadcasted to all other processes.
+    """
+    if isinstance(params, dict):
+        params = sorted(params.items())
+    elif isinstance(params, list):
+        # support both named_parameters() and regular parameters()
+        params = [p if isinstance(p, tuple) else (None, p) for p in params]
+    else:
+        raise ValueError('invalid params of type: %s' % type(params))
+
+    # Run synchronous broadcasts.
+    for name, p in params:
+        torch.distributed.broadcast(p, root_rank, group=comm_group)
+
+
+def broadcast_optimizer_state(optimizer, root_rank, named_params: dict, comm_group=None):
+    """
+    Broadcasts an optimizer state from root rank to all other processes.
+    Arguments:
+        optimizer: An optimizer.
+        root_rank: The rank of the process from which the optimizer will be
+                   broadcasted to all other processes.
+    """
+    if isinstance(optimizer, torch.optim.LBFGS):
+        # TODO(travis): L-BFGS cannot be easily supported without serializing
+        # the entire state_dict, as its structure is deeply nested and contains
+        # None type parameter values
+        raise ValueError('cannot broadcast torch.optim.LBFGS state')
+
+    state_dict = optimizer.state_dict()
+
+    # Newly created optimizers will not have their state initialized, so
+    # do that initialization here
+    if len(state_dict['state']) == 0:
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                p.grad = p.data.new(p.size()).zero_()
+        # This function accepts a torch.optim.Optimizer or a DistributedOptimizer
+        # wrapped around a torch optimizer. Calling step() with a DistributedOptimizer
+        # forces all_reduce on all model parameters, which will result in deadlock
+        # unless every rank calls step(). Therefore, to finish state initialization
+        # only call optimizer.step() with a torch.optim.Optimizer.
+        optimizer.step()
+        state_dict = optimizer.state_dict()
+
+    # If the state_dict is still empty after initialization, then
+    # the optimizer is stateless, and there is nothing to broadcast.
+    # Furthermore, attempting to access the state dict would result in
+    # an error.
+    if len(state_dict['state']) == 0:
+        return
+
+    params = []
+    scalars = {}
+    callbacks = {}
+    occurrences = collections.defaultdict(int)
+
+    # Returns the full type structure of the possibly nested objects for recursive casting back
+    def _get_types(x):
+        if isinstance(x, collections.Iterable):
+            return type(x), [_get_types(xi) for xi in x]
+        else:
+            return type(x)
+
+    # Casts an object encoded in a tensor back into its original type and subtypes
+    def _recursive_cast(x, dtype):
+        if isinstance(dtype, tuple):
+            t, dtypes = dtype
+            x = t(x)
+            return t([_recursive_cast(x[i], dtypes[i]) for i in range(len(x))])
+        else:
+            return dtype(x)
+
+    # Some optimizer parameters may be represented as scalars instead of
+    # tensors.  In such cases, we place the scalars into a single dict,
+    # then pickle and broadcast with broadcast_object (under the assumption
+    # that there are not many scalars, and so the overhead of pickling will
+    # be relatively low). Because broadcast_object is performed out-of-place,
+    # we then use a callback to assign the new value to the correct element
+    # of the optimizer state.
+    def _create_state_callback(pid, name):
+        def _assign_state(v):
+            state_dict['state'][pid][name] = v
+        return _assign_state
+
+    def _create_option_callback(index, option_key):
+        def _assign_option(v):
+            optimizer.param_groups[index][option_key] = v
+        return _assign_option
+
+    # Param groups are an ordered list, normally there is only one per model,
+    # but users can add additional param groups for example to train
+    # previously frozen layers
+    for index, group in enumerate(state_dict['param_groups']):
+        # Broadcast options like learning rate
+        for option_key, option_value in group.items():
+            if option_key == 'params':
+                continue
+
+            # Options like the learning rate are scalar, and need to be broadcast separately
+            key = '%s.%d' % (option_key, index)
+            # dtypes = _get_types(option_value)
+            # option_tensor = torch.Tensor([option_value]).cuda()
+            scalars[key] = option_value
+            callbacks[key] = _create_option_callback(index, option_key)
+
+        # The params list here is ordered by the layers in the model
+        for pid in group['params']:
+            if pid not in state_dict['state']:
+                # The param has not set requires_grad, so skip broadcast
+                continue
+
+            param_state = state_dict['state'][pid]
+            for name, p in param_state.items():
+                if name not in named_params:
+                    continue
+                # Some parameter names may appear more than once, in which
+                # case we ensure they have a unique identifier defined by
+                # their order
+                occurrences[name] += 1
+                key = '%s.%d' % (str(name), occurrences[name])
+
+                if torch.is_tensor(p):
+                    # Tensor -> use broadcast_parameters
+                    params.append((key, p))
+                else:
+                    # Scalar -> use broadcast_object
+                    scalars[key] = p
+                    callbacks[key] = _create_state_callback(pid, name)
+
+    # Synchronized broadcast of all parameters
+    broadcast_parameters(params, root_rank, comm_group=comm_group)
+
+    # Broadcast and cleanup for non-tensor parameters
+    scalars = broadcast_object(scalars, root_rank, comm_group=comm_group)
+    for key, p in scalars.items():
+        callbacks[key](p)
+
+def broadcast_object(obj, root_rank=0, name=None, comm_group=None):
+    """
+    Serializes and broadcasts an object from root rank to all other processes.
+    Typical usage is to broadcast the `optimizer.state_dict()`, for example:
+    .. code-block:: python
+        state_dict = broadcast_object(optimizer.state_dict(), 0)
+        if get_rank() > 0:
+            optimizer.load_state_dict(state_dict)
+    Arguments:
+        obj: An object capable of being serialized without losing any context.
+        root_rank: The rank of the process from which parameters will be
+                   broadcasted to all other processes.
+        name: Optional name to use during broadcast, will default to the class
+              type.
+    Returns:
+        The object that was broadcast from the `root_rank`.
+    """
+    if name is None:
+        name = type(obj).__name__
+
+    if get_rank(comm_group) == root_rank:
+        b = io.BytesIO()
+        cloudpickle.dump(obj, b)
+        t = torch.ByteTensor(bytearray(b.getvalue())).cuda()
+        sz = torch.IntTensor([t.shape[0]]).cuda()
+        broadcast_parameters([(name + '.sz', sz)], root_rank, comm_group=comm_group)
+    else:
+        sz = torch.IntTensor([0]).cuda()
+        broadcast_parameters([(name + '.sz', sz)], root_rank, comm_group=comm_group)
+        t = torch.ByteTensor(sz.cpu().tolist()[0]).cuda()
+
+    broadcast_parameters([(name + '.t', t)], root_rank, comm_group=comm_group)
+
+    if get_rank(comm_group) != root_rank:
+        buf = io.BytesIO(t.cpu().numpy().tobytes())
+        obj = cloudpickle.load(buf)
+
+    return obj
