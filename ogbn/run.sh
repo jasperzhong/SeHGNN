@@ -19,7 +19,7 @@ if [ $N_GPU -eq 1 ]; then
     --bns \
     --label-bns \
     --lr 0.001 \
-    --weight-decay 0 \
+    --weight-decay 1e-4 \
     --threshold 0.75 \
     --patience 200 \
     --gama 10 \
@@ -42,7 +42,7 @@ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=${N_GPU} main_dist.py \
     --bns \
     --label-bns \
     --lr 0.001 \
-    --weight-decay 0 \
+    --weight-decay 1e-4 \
     --threshold 0.75 \
     --patience 200 \
     --gama 10 \
