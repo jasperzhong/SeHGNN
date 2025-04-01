@@ -17,7 +17,7 @@ from utils import *
 def main(args):
     if args.seed > 0:
         set_random_seed(args.seed)
-        
+    
     g, init_labels, num_nodes, n_classes, train_nid, val_nid, test_nid, evaluator = load_dataset(args)
 
     dist.init_process_group(backend='nccl', init_method='env://')
@@ -25,6 +25,8 @@ def main(args):
     local_rank = rank % torch.cuda.device_count()
     world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)
+
+    args.batch_size = args.batch_size * world_size
 
     # =======
     # rearange node idx (for feats & labels)
@@ -311,10 +313,24 @@ def main(args):
         if len(feats) < world_size:
             raise RuntimeError(f"Number of metapaths {len(feats)} is less than world size {world_size}.")
         # local_feats = {k: v for i, (k, v) in enumerate(feats.items()) if i % world_size == rank}
-        if rank == 0:
-            keys = ['P', 'PP', 'PAP', 'PFP', 'PPP']
-        elif rank == 1:
-            keys = ['PA', 'PF', 'PAI', 'PPA', 'PPF']
+        if world_size == 2:
+            if rank == 0:
+                # keys = ['P', 'PP', 'PAP', 'PFP', 'PPP']
+                keys = ['P', 'PA', 'PP', 'PF', 'PAP']
+            elif rank == 1:
+                # keys = ['PA', 'PF', 'PAI', 'PPA', 'PPF']
+                keys = ['PAI', 'PFP', 'PPA', 'PPP', 'PPF']
+            
+            all_shapes = []
+        elif world_size == 4:
+            if rank == 0:
+                keys = ['P', 'PA']
+            elif rank == 1:
+                keys = ['PP', 'PF', 'PAI']
+            elif rank == 2:
+                keys = ['PAP', 'PFP']
+            elif rank == 3:
+                keys = ['PPA', 'PPP', 'PPF']
 
         local_feats = {k: feats[k] for k in keys if k in feats}
         global_num_feats = len(feats)
@@ -339,7 +355,7 @@ def main(args):
         # =======
         # Construct network
         # =======
-        model = SeHGNN_mag(args.dataset,
+        model_mp = SeHGNN_mag_mp(args.dataset,
             data_size, args.embed_size,
             args.hidden, n_classes,
             len(feats), global_num_feats, len(label_feats), tgt_type,
@@ -356,36 +372,40 @@ def main(args):
             # label_residual=stage > 0,
             use_dist=True
             )
-        model = model.to(device)
-        
-        named_params = {name: p for name, p in model.named_parameters() if p.requires_grad and \
-            (not name.startswith('embedings') and not name.startswith('feat_project_layers'))}
-        named_params = sorted(named_params.items(), key=lambda x: x[0])
-        print(f"Rank {rank} model has {len(named_params)} trainable parameters")
-        if rank == 0:
-            print(named_params)
+        model_dp = SeHGNN_mag_dp(args.dataset,
+            data_size, args.embed_size,
+            args.hidden, n_classes,
+            len(feats), global_num_feats, len(label_feats), tgt_type,
+            dropout=args.dropout,
+            input_drop=args.input_drop,
+            att_drop=args.att_drop,
+            label_drop=args.label_drop,
+            n_layers_1=args.n_layers_1,
+            n_layers_2=args.n_layers_2,
+            n_layers_3=args.n_layers_3,
+            act=args.act,
+            residual=args.residual,
+            bns=args.bns, label_bns=args.label_bns,
+            # label_residual=stage > 0,
+            use_dist=True
+            )
+        model_mp = model_mp.to(device)
+        model_dp = model_dp.to(device)
 
-        for name, p in named_params:
-            torch.distributed.broadcast(p.data, src=0)
-        
-        torch.distributed.barrier()
-        print(f"Rank {rank} model finished broadcasting")
-        
+        model_dp = torch.nn.parallel.DistributedDataParallel(
+            model_dp, device_ids=[local_rank], output_device=local_rank)
 
         if stage == args.start_stage:
-            print(model)
-            print("# Params:", get_n_params(model))
+            print(model_mp)
+            print(model_dp)
+            print("# model mp Params:", get_n_params(model_mp))
+            print("# model dp Params:", get_n_params(model_dp))
 
         loss_fcn = nn.CrossEntropyLoss()
-        print(f"Rank {rank} loss function created")
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
-                                    weight_decay=args.weight_decay)
-        print(f"Rank {rank} optimizer created")
-
-        broadcast_optimizer_state(optimizer, 0, named_params) 
-
-        print(f"Rank {rank} optimizer state broadcasted")
-
+        optimizer = torch.optim.Adam([
+            {'params': model_mp.parameters(), 'lr': args.lr*np.sqrt(world_size), 'weight_decay': args.weight_decay},
+            {'params': model_dp.parameters(), 'lr': args.lr*np.sqrt(world_size), 'weight_decay': args.weight_decay},
+        ])
 
         best_epoch = 0
         best_val_acc = 0
@@ -397,9 +417,10 @@ def main(args):
             torch.cuda.empty_cache()
             start = time.time()
             if stage == 0:
-                loss, acc = train(model, train_loader, loss_fcn, optimizer, evaluator, device, feats, label_feats, labels_cuda, label_emb, scalar=scalar)
+                loss, acc = train(model_mp, model_dp, train_loader, loss_fcn, optimizer, evaluator, device, feats, label_feats, labels_cuda, label_emb, scalar=scalar)
             else:
-                loss, acc = train_multi_stage(model, train_loader, enhance_loader, loss_fcn, optimizer, evaluator, device, feats, label_feats, labels_cuda, label_emb, predict_prob, args.gama, scalar=scalar)
+                # loss, acc = train_multi_stage(model, train_loader, enhance_loader, loss_fcn, optimizer, evaluator, device, feats, label_feats, labels_cuda, label_emb, predict_prob, args.gama, scalar=scalar)
+                pass
             end = time.time()
             training_time = end - start
 
@@ -407,23 +428,39 @@ def main(args):
 
             if epoch % args.eval_every == 0:
                 with torch.no_grad():
-                    model.eval()
+                    model_mp.eval()
+                    model_dp.eval()
                     raw_preds = []
+                    eval_labels = labels_cuda[trainval_point:total_num_nodes]
+
+                    eval_labels_list = []
 
                     start = time.time()
-                    for batch_feats, batch_label_feats, batch_labels_emb in eval_loader:
-                        batch_feats = {k: v.to(device) for k,v in batch_feats.items()}
+                    for i, (batch_feats, batch_label_feats, batch_labels_emb) in enumerate(eval_loader):
+                        batch_feats = {k: v.to(device, non_blocking=True) for k,v in batch_feats.items()}
                         batch_label_feats = {k: v.to(device) for k,v in batch_label_feats.items()}
-                        batch_labels_emb = batch_labels_emb.to(device)
-                        raw_preds.append(model(batch_feats, batch_label_feats, batch_labels_emb).cpu())
-                    raw_preds = torch.cat(raw_preds, dim=0)
+                        B = batch_labels_emb.shape[0]
+                        chunk_size = B // world_size
+                        batch_labels_emb = batch_labels_emb[rank*chunk_size:(rank+1)*chunk_size]
+                        batch_labels_emb = batch_labels_emb.to(device, non_blocking=True)
 
-                    loss_val = loss_fcn(raw_preds[:valid_node_nums], labels[trainval_point:valtest_point]).item()
-                    loss_test = loss_fcn(raw_preds[valid_node_nums:valid_node_nums+test_node_nums], labels[valtest_point:total_num_nodes]).item()
+                        x, tgt_feat = model_mp(batch_feats, batch_label_feats, batch_labels_emb)
+                        output_att = model_dp(x, tgt_feat, batch_label_feats, batch_labels_emb)
+                        eval_label = eval_labels[i*B:(i+1)*B]
+                        raw_preds.append(output_att.cpu())
+                        eval_label = eval_label[rank*chunk_size:(rank+1)*chunk_size]
+                        eval_labels_list.append(eval_label.cpu())
+                        # raw_preds.append(model(batch_feats, batch_label_feats, batch_labels_emb).cpu())
+                    raw_preds = torch.cat(raw_preds, dim=0)
+                    eval_labels = torch.cat(eval_labels_list, dim=0)
+
+                    valid_node_nums_rank = valid_node_nums // world_size
+                    loss_val = loss_fcn(raw_preds[:valid_node_nums_rank], eval_labels[:valid_node_nums_rank]).item()
+                    loss_test = loss_fcn(raw_preds[valid_node_nums_rank:], eval_labels[valid_node_nums_rank:]).item()
 
                     preds = raw_preds.argmax(dim=-1)
-                    val_acc = evaluator(preds[:valid_node_nums], labels[trainval_point:valtest_point])
-                    test_acc = evaluator(preds[valid_node_nums:valid_node_nums+test_node_nums], labels[valtest_point:total_num_nodes])
+                    val_acc = evaluator(preds[:valid_node_nums_rank], eval_labels[:valid_node_nums_rank])
+                    test_acc = evaluator(preds[valid_node_nums_rank:], eval_labels[valid_node_nums_rank:])
 
                     end = time.time()
                     val_time = end - start

@@ -133,9 +133,10 @@ def check_acc(preds_dict, condition, init_labels, train_nid, val_nid, test_nid):
     return remove_label_keys
 
 
-def train(model, train_loader, loss_fcn, optimizer, evaluator, device,
+def train(model_mp, model_dp, train_loader, loss_fcn, optimizer, evaluator, device,
           feats, label_feats, labels_cuda, label_emb, mask=None, scalar=None):
-    model.train()
+    model_mp.train()
+    model_dp.train()
     total_loss = 0
     iter_num = 0
     y_true, y_pred = [], []
@@ -147,13 +148,21 @@ def train(model, train_loader, loss_fcn, optimizer, evaluator, device,
         #     batch_mask = {k: x[batch].to(device) for k, x in mask.items()}
         # else:
         #     batch_mask = None
-        batch_label_emb = label_emb[batch].to(device)
+
         batch_y = labels_cuda[batch]
+        rank = get_rank()
+        world_size = get_world_size()
+        B = len(batch_y) // world_size
+        batch_y = batch_y[rank*B: (rank+1)*B]
+
+        batch_label_emb = label_emb[batch][rank*B: (rank+1)*B, :]
+        batch_label_emb = batch_label_emb.to(device, non_blocking=True)
 
         optimizer.zero_grad()
         if scalar is not None:
             with torch.cuda.amp.autocast():
-                output_att = model(batch_feats, batch_labels_feats, batch_label_emb)
+                x, tgt_feat = model_mp(batch_feats, batch_labels_feats, batch_label_emb)
+                output_att = model_dp(x, tgt_feat, batch_labels_feats, batch_label_emb)
                 if isinstance(loss_fcn, nn.BCELoss):
                     output_att = torch.sigmoid(output_att)
                 loss_train = loss_fcn(output_att, batch_y)
@@ -161,7 +170,8 @@ def train(model, train_loader, loss_fcn, optimizer, evaluator, device,
             scalar.step(optimizer)
             scalar.update()
         else:
-            output_att = model(batch_feats, batch_labels_feats, batch_label_emb)
+            x, tgt_feat = model_mp(batch_feats, batch_labels_feats, batch_label_emb)
+            output_att = model_dp(x, tgt_feat, batch_labels_feats, batch_label_emb)
             if isinstance(loss_fcn, nn.BCELoss):
                 output_att = torch.sigmoid(output_att)
             L1 = loss_fcn(output_att, batch_y)

@@ -124,19 +124,21 @@ class L2Norm(nn.Module):
         return F.normalize(x, p=2, dim=self.dim)
 
 
-class SeHGNN_mag(nn.Module):
+class SeHGNN_mag_mp(nn.Module):
     def __init__(self, dataset, data_size, nfeat, hidden, nclass,
                  num_feats, global_num_feats, num_label_feats, tgt_key,
                  dropout, input_drop, att_drop, label_drop,
                  n_layers_1, n_layers_2, n_layers_3,
                  act, residual=False, bns=False, label_bns=False,
                  label_residual=True, use_dist=False):
-        super(SeHGNN_mag, self).__init__()
+        super(SeHGNN_mag_mp, self).__init__()
         self.dataset = dataset
         self.residual = residual
         self.tgt_key = tgt_key
         self.label_residual = label_residual
         self.use_dist = use_dist
+        self.nfeat = nfeat
+        self.global_num_feats = global_num_feats
 
         if self.use_dist:
             self.rank = dist.get_rank()
@@ -157,13 +159,112 @@ class SeHGNN_mag(nn.Module):
         else:
             self.embedings = None
 
+        self.dropout = nn.Dropout(dropout)
+        self.input_drop = nn.Dropout(input_drop)
+        self.all_shapes = None
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        pass
+
+    def forward(self, feats_dict, layer_feats_dict, label_emb):
+        if self.embedings is not None:
+            for k, v in feats_dict.items():
+                if k in self.embedings:
+                    feats_dict[k] = v @ self.embedings[k]
+
+        if self.tgt_key in feats_dict:
+            tgt_feat = self.input_drop(feats_dict[self.tgt_key])
+            if self.use_dist:
+                chunk_size = tgt_feat.size(0) // self.world_size
+                tgt_feat_list = [tgt_feat[i * chunk_size:(i + 1) * chunk_size, :] for i in range(self.world_size)]
+                tgt_feat_tmp = torch.empty(tgt_feat_list[0].shape, device=self.local_rank, dtype=tgt_feat.dtype)
+                dist.scatter(tgt_feat_tmp, tgt_feat_list, src=0)
+                del tgt_feat_list
+                tgt_feat = tgt_feat_tmp
+        else:
+            if self.use_dist:
+                keys = list(feats_dict.keys())
+                B = feats_dict[keys[0]].size(0)
+                chunk_size = B // self.world_size
+                dtype = torch.float16 if self.training else torch.float32
+                tgt_feat = torch.empty((chunk_size, self.nfeat), device=self.local_rank, dtype=dtype)
+                dist.scatter(tgt_feat, None, src=0)
+
+        x = self.input_drop(torch.stack(list(feats_dict.values()), dim=1))
+        x = x.to(torch.float16)
+
+        if self.use_dist:
+            all_shapes = [None for _ in range(self.world_size)]
+            dist.all_gather_object(all_shapes, x.shape)
+
+            output_tensors = [torch.empty(tuple(shape), device=x.device, dtype=x.dtype) for shape in all_shapes]
+            dist.all_gather(output_tensors, x)
+
+            x = torch.cat(output_tensors, dim=1)
+            chunk_size = x.size(0) // self.world_size
+            x = x[self.rank * chunk_size:(self.rank + 1) * chunk_size, :, :]
+            # if self.rank == 0:
+            #     self.all_shapes = [None for _ in range(self.world_size)]
+            #     dist.gather_object(x.shape, self.all_shapes, dst=0)
+            # else:
+            #     dist.gather_object(x.shape, None, dst=0)
+            #     self.all_shapes = [x.shape]
+            
+            # if self.rank == 0:
+            #     output_tensors = [torch.empty(tuple(shape), device=x.device, dtype=x.dtype) for shape in self.all_shapes]
+            #     print(f"{self.rank} gather x of shape {self.all_shapes} to rank 0")
+            #     dist.gather(x, output_tensors, dst=0)
+            # else:
+            #     print(f"{self.rank} send x of shape {x.shape} to rank 0")
+            #     dist.gather(x, None, dst=0)
+            
+            # if self.rank == 0:
+            #     x = torch.cat(output_tensors, dim=1)
+            #     x_list = [x[i * chunk_size:(i + 1) * chunk_size, :, :] for i in range(self.world_size)]
+            #     x = torch.empty((chunk_size, self.global_num_feats, self.nfeat), device=self.local_rank, dtype=x.dtype)
+            #     dist.scatter(x, x_list, src=0)
+            # else:
+            #     x = torch.empty((chunk_size, self.global_num_feats, self.nfeat), device=self.local_rank, dtype=x.dtype)
+            #     dist.scatter(x, None, src=0)
+
+            x = x.to(torch.float32)
+        
+        return x, tgt_feat
+        
+
+class SeHGNN_mag_dp(nn.Module):
+    def __init__(self, dataset, data_size, nfeat, hidden, nclass,
+                 num_feats, global_num_feats, num_label_feats, tgt_key,
+                 dropout, input_drop, att_drop, label_drop,
+                 n_layers_1, n_layers_2, n_layers_3,
+                 act, residual=False, bns=False, label_bns=False,
+                 label_residual=True, use_dist=False):
+        super(SeHGNN_mag_dp, self).__init__()
+        self.dataset = dataset
+        self.residual = residual
+        self.tgt_key = tgt_key
+        self.label_residual = label_residual
+        self.use_dist = use_dist
+
+        if self.use_dist:
+            self.rank = dist.get_rank()
+            self.local_rank = self.rank % torch.cuda.device_count()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.local_rank = 0
+            self.world_size = 1
+
+
         self.feat_project_layers = nn.Sequential(
-            Conv1d1x1(nfeat, hidden, num_feats, bias=True, cformat='channel-first'),
-            nn.LayerNorm([num_feats, hidden]),
+            Conv1d1x1(nfeat, hidden, global_num_feats, bias=True, cformat='channel-first'),
+            nn.LayerNorm([global_num_feats, hidden]),
             nn.PReLU(),
             nn.Dropout(dropout),
-            Conv1d1x1(hidden, hidden, num_feats, bias=True, cformat='channel-first'),
-            nn.LayerNorm([num_feats, hidden]),
+            Conv1d1x1(hidden, hidden, global_num_feats, bias=True, cformat='channel-first'),
+            nn.LayerNorm([global_num_feats, hidden]),
             nn.PReLU(),
             nn.Dropout(dropout),
         )
@@ -220,7 +321,6 @@ class SeHGNN_mag(nn.Module):
 
         self.prelu = nn.PReLU()
         self.dropout = nn.Dropout(dropout)
-        self.input_drop = nn.Dropout(input_drop)
 
         self.reset_parameters()
 
@@ -255,29 +355,13 @@ class SeHGNN_mag(nn.Module):
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
 
-    def forward(self, feats_dict, layer_feats_dict, label_emb):
-        if self.embedings is not None:
-            for k, v in feats_dict.items():
-                if k in self.embedings:
-                    feats_dict[k] = v @ self.embedings[k]
+    def forward(self, x, tgt_feat, layer_feats_dict, label_emb):
+        # == data parallelism ==
+        # split by batch size
+        # chunk_size = x.size(0) // self.world_size
+        # x = x[self.rank * chunk_size:(self.rank + 1) * chunk_size, :,:]
+        B = x.size(0)
 
-        if self.tgt_key in feats_dict:
-            tgt_feat = self.input_drop(feats_dict[self.tgt_key])
-            # bcast:
-            if self.use_dist:
-                dist.broadcast_object_list([tgt_feat.shape, tgt_feat.dtype], src=0)
-                dist.broadcast(tgt_feat, src=0)
-        else:
-            if self.use_dist:
-                recv = [None, None]
-                dist.broadcast_object_list(recv, src=0)
-                shape, dtype = recv
-
-                tgt_feat = torch.empty(tuple(shape), device=self.local_rank, dtype=dtype)
-                dist.broadcast(tgt_feat, src=0)
-
-        B = num_node = tgt_feat.size(0)
-        x = self.input_drop(torch.stack(list(feats_dict.values()), dim=1))
         x = self.feat_project_layers(x)
 
         if self.label_feat_project_layers is not None:
@@ -285,33 +369,20 @@ class SeHGNN_mag(nn.Module):
             label_feats = self.label_feat_project_layers(label_feats)
             x = torch.cat((x, label_feats), dim=1)
 
-        if self.use_dist:
-            local_shape = torch.tensor(x.shape, device=x.device)
-            all_shapes = [torch.empty_like(local_shape) for _ in range(self.world_size)]
-            dist.all_gather(all_shapes, local_shape)
-
-            output_tensors = [torch.empty(tuple(shape.tolist()), device=x.device, dtype=x.dtype) for shape in all_shapes]
-            dist.all_gather(output_tensors, x)
-
-            x = torch.cat(output_tensors, dim=1)
-        
         x = self.semantic_aggr_layers(x)
 
-        #print(f"[1] rank {self.rank} gather x's sum {torch.sum(x)}")    
         if self.dataset == 'products':
             x = x[:,:,0].contiguous()
         else:
             x = self.concat_project_layer(x.reshape(B, -1))
 
-        #print(f"[2] rank {self.rank} gather x's sum {torch.sum(x)}")    
         if self.residual:
             x = x + self.res_fc(tgt_feat)
-        #print(f"[3] rank {self.rank} gather x's sum {torch.sum(x)}")    
         x = self.dropout(self.prelu(x))
+      
         x = self.lr_output(x)
-        #print(f"[4] rank {self.rank} gather x's sum {torch.sum(x)}")    
-        #print(f"[4.5] rank {self.rank} label_emb's sum {torch.sum(label_emb)}")    
+
         if self.label_residual:
             x = x + self.label_fc(self.label_drop(label_emb))
-        #print(f"[5] rank {self.rank} gather x's sum {torch.sum(x)}")    
+     
         return x
